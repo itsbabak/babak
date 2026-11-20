@@ -25,7 +25,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. پیدا کردن و استخراج سورس Frago
+      # 2. پیدا کردن سورس Frago
       - name: Locate and extract Frago source
         id: source
         shell: bash
@@ -36,7 +36,6 @@ jobs:
 
           if [ -f "tools/apply_overlay.py" ] && [ -f "tools/build.py" ]; then
             SOURCE_DIR="$GITHUB_WORKSPACE"
-            echo "Frago source found in repository root."
           else
             ARCHIVE=$(find "$GITHUB_WORKSPACE" \
               -maxdepth 3 \
@@ -53,7 +52,7 @@ jobs:
             fi
 
             if [ -z "$ARCHIVE" ]; then
-              echo "No Frago source ZIP found."
+              echo "Frago ZIP not found."
               exit 1
             fi
 
@@ -66,7 +65,7 @@ jobs:
               -print -quit)
 
             if [ -z "$APPLY_SCRIPT" ]; then
-              echo "Frago apply_overlay.py not found."
+              echo "apply_overlay.py not found."
               exit 1
             fi
 
@@ -78,9 +77,9 @@ jobs:
           test -d "$SOURCE_DIR/overlay/src/main"
 
           echo "source_dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
-          echo "Source directory: $SOURCE_DIR"
+          echo "Frago source: $SOURCE_DIR"
 
-      # 3. نصب Java 17
+      # 3. نصب Java
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -121,7 +120,7 @@ jobs:
 
           git -C .build/upstream submodule update --init --recursive
 
-      # 7. اعمال Frago Overlay
+      # 7. اعمال Frago
       - name: Apply Frago overlay
         shell: bash
         env:
@@ -132,9 +131,9 @@ jobs:
           python3 "$SOURCE_DIR/tools/apply_overlay.py" \
             "$GITHUB_WORKSPACE/.build/upstream"
 
-          echo "Frago overlay applied successfully."
+          echo "Frago overlay applied."
 
-      # 8. رفع تداخل آیکون‌ها
+      # 8. حذف آیکون‌های تکراری
       - name: Fix duplicate Android launcher icons
         working-directory: .build/upstream
         shell: bash
@@ -157,19 +156,22 @@ jobs:
             done
           done
 
-          echo "Remaining launcher resources:"
+          echo "Launcher resource check:"
           find "$RES" -type f \
             \( -name 'ic_launcher.*' -o -name 'ic_launcher_round.*' \) \
             -print
 
-      # 9. تنظیم مخازن جایگزین Gradle
+      # 9. تنظیم مخازن Gradle بدون تغییر project.repositories
       - name: Configure Gradle repositories
         shell: bash
         run: |
           set -euo pipefail
 
           cat > "$RUNNER_TEMP/gradle-init.gradle" <<'EOF'
+
           settingsEvaluated { settings ->
+
+              // Plugin repositories
               settings.pluginManagement.repositories {
                   maven {
                       url 'https://maven.aliyun.com/repository/gradle-plugin'
@@ -184,8 +186,22 @@ jobs:
                   google()
                   mavenCentral()
               }
+
+              // Dependency repositories
+              settings.dependencyResolutionManagement.repositories {
+                  maven {
+                      url 'https://maven.aliyun.com/repository/google'
+                  }
+                  maven {
+                      url 'https://maven.aliyun.com/repository/public'
+                  }
+                  google()
+                  mavenCentral()
+              }
           }
 
+          // Buildscript repositories only.
+          // Do NOT modify project.repositories.
           gradle.beforeProject { project ->
               project.buildscript.repositories {
                   maven {
@@ -199,23 +215,12 @@ jobs:
                   }
                   google()
                   mavenCentral()
-                  gradlePluginPortal()
-              }
-
-              project.repositories {
-                  maven {
-                      url 'https://maven.aliyun.com/repository/google'
-                  }
-                  maven {
-                      url 'https://maven.aliyun.com/repository/public'
-                  }
-                  google()
-                  mavenCentral()
               }
           }
+
           EOF
 
-          echo "Gradle fallback repositories configured."
+          echo "Gradle repositories configured."
 
       # 10. ساخت APK
       - name: Build ARM64 APK
@@ -226,39 +231,16 @@ jobs:
 
           chmod +x gradlew
 
-          BUILD_SUCCESS=0
+          ./gradlew \
+            --no-daemon \
+            --no-configuration-cache \
+            --init-script "$RUNNER_TEMP/gradle-init.gradle" \
+            --stacktrace \
+            clean assembleDebug
 
-          for ATTEMPT in 1 2 3; do
-            echo "======================================"
-            echo "Build attempt: $ATTEMPT / 3"
-            echo "======================================"
+          echo "Build completed."
 
-            if ./gradlew \
-              --no-daemon \
-              --no-configuration-cache \
-              --refresh-dependencies \
-              --init-script "$RUNNER_TEMP/gradle-init.gradle" \
-              --stacktrace \
-              clean assembleDebug; then
-
-              BUILD_SUCCESS=1
-              break
-            fi
-
-            if [ "$ATTEMPT" -lt 3 ]; then
-              echo "Build failed. Retrying in 20 seconds..."
-              sleep 20
-            fi
-          done
-
-          if [ "$BUILD_SUCCESS" -ne 1 ]; then
-            echo "Gradle build failed after 3 attempts."
-            exit 1
-          fi
-
-          echo "APK build completed."
-
-      # 11. بررسی وجود APK و معماری ARM64
+      # 11. بررسی معماری
       - name: Verify APK architecture
         shell: bash
         run: |
@@ -271,26 +253,26 @@ jobs:
             exit 1
           fi
 
-          echo "APK file information:"
+          echo "APK size:"
           ls -lh "$APK"
 
           echo "Native libraries:"
           unzip -Z1 "$APK" | grep '^lib/' || true
 
           if ! unzip -Z1 "$APK" | grep -q '^lib/arm64-v8a/'; then
-            echo "ARM64 native libraries not found."
+            echo "ARM64 libraries not found."
             exit 1
           fi
 
           if unzip -Z1 "$APK" | grep -Eq \
             '^lib/(armeabi-v7a|x86|x86_64)/'; then
-            echo "Unexpected ABI found in APK."
+            echo "Unexpected ABI found."
             exit 1
           fi
 
           echo "ARM64 verification passed."
 
-      # 12. آماده‌سازی خروجی
+      # 12. آماده‌سازی APK
       - name: Prepare APK artifact
         shell: bash
         run: |
@@ -305,7 +287,6 @@ jobs:
           sha256sum artifacts/Frago-ARM64.apk \
             > artifacts/SHA256SUMS.txt
 
-          echo "Final APK:"
           ls -lh artifacts/
 
       # 13. انتشار APK
@@ -317,8 +298,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 14. ذخیره لاگ در صورت شکست
-      - name: Upload Gradle diagnostic logs
+      # 14. ذخیره گزارش خطا
+      - name: Upload build diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
