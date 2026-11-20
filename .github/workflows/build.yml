@@ -12,15 +12,33 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout Frago overlay
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify Frago source files
+      - name: Extract Frago source ZIP
+        shell: bash
         run: |
-          test -f tools/apply_overlay.py || { echo "Missing tools/apply_overlay.py. Upload the COMPLETE Frago ZIP contents to the repository root."; exit 1; }
-          test -f overlay/src/main/java/io/github/dovecoteescapee/byedpi/FragoActivity.kt || { echo "Missing overlay source files. Upload the COMPLETE Frago ZIP contents to the repository root."; exit 1; }
-          test -f frago-config.example.json || { echo "Missing frago-config.example.json."; exit 1; }
-          echo "Frago source tree found."
+          set -euo pipefail
+          ZIP_FILE="$(find . -maxdepth 2 -type f -name 'Frago-GitHub-Source-FIX2.zip' -print -quit)"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "Frago ZIP was not found in the repository."
+            exit 1
+          fi
+          mkdir -p .frago-extract
+          unzip -q "$ZIP_FILE" -d .frago-extract
+          APPLY_FILE="$(find .frago-extract -type f -path '*/tools/apply_overlay.py' -print -quit)"
+          if [ -z "$APPLY_FILE" ]; then
+            echo "The ZIP does not contain tools/apply_overlay.py."
+            echo "Check that the correct complete Frago source ZIP was uploaded."
+            exit 1
+          fi
+          SOURCE_ROOT="$(dirname "$(dirname "$APPLY_FILE")")"
+          echo "Using Frago source root: $SOURCE_ROOT"
+          cp -a "$SOURCE_ROOT"/. .
+          test -f tools/apply_overlay.py
+          test -f overlay/src/main/java/io/github/dovecoteescapee/byedpi/FragoActivity.kt
+          test -f frago-config.example.json
+          echo "Frago source extracted and verified."
 
       - name: Set up Java
         uses: actions/setup-java@v4
