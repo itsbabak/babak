@@ -18,7 +18,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       # 1. دریافت مخزن
@@ -53,12 +53,11 @@ jobs:
             fi
 
             if [ -z "$ARCHIVE" ]; then
-              echo "No source ZIP found."
+              echo "No Frago source ZIP found."
               exit 1
             fi
 
             echo "Extracting: $ARCHIVE"
-
             unzip -q "$ARCHIVE" -d .build/frago-source
 
             APPLY_SCRIPT=$(find .build/frago-source \
@@ -67,7 +66,7 @@ jobs:
               -print -quit)
 
             if [ -z "$APPLY_SCRIPT" ]; then
-              echo "apply_overlay.py not found."
+              echo "Frago apply_overlay.py not found."
               exit 1
             fi
 
@@ -76,25 +75,25 @@ jobs:
 
           test -f "$SOURCE_DIR/tools/apply_overlay.py"
           test -f "$SOURCE_DIR/tools/build.py"
+          test -d "$SOURCE_DIR/overlay/src/main"
 
           echo "source_dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
+          echo "Source directory: $SOURCE_DIR"
 
-          echo "Selected source: $SOURCE_DIR"
-
-      # 3. نصب Java
+      # 3. نصب Java 17
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 4. تنظیم Android SDK
+      # 4. نصب Android SDK
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
           packages: platform-tools
 
-      # 5. نصب ابزارهای موردنیاز
+      # 5. نصب ابزارهای Android
       - name: Install Android build packages
         shell: bash
         run: |
@@ -106,7 +105,7 @@ jobs:
             "ndk;26.3.11579264" \
             "cmake;3.22.1"
 
-      # 6. دریافت پروژه اصلی ByeDPIAndroid
+      # 6. دریافت پروژه اصلی
       - name: Fetch upstream ByeDPIAndroid
         shell: bash
         run: |
@@ -122,7 +121,7 @@ jobs:
 
           git -C .build/upstream submodule update --init --recursive
 
-      # 7. اعمال تغییرات Frago
+      # 7. اعمال Frago Overlay
       - name: Apply Frago overlay
         shell: bash
         env:
@@ -144,8 +143,6 @@ jobs:
 
           RES="app/src/main/res"
 
-          echo "Checking launcher resources..."
-
           for DIR in "$RES"/mipmap-*; do
             [ -d "$DIR" ] || continue
 
@@ -154,31 +151,73 @@ jobs:
               WEBP="$DIR/$NAME.webp"
 
               if [ -f "$PNG" ] && [ -f "$WEBP" ]; then
-                echo "Duplicate found: $PNG"
+                echo "Removing duplicate: $PNG"
                 rm -f "$PNG"
               fi
             done
           done
 
-          echo "Checking remaining duplicates..."
+          echo "Remaining launcher resources:"
+          find "$RES" -type f \
+            \( -name 'ic_launcher.*' -o -name 'ic_launcher_round.*' \) \
+            -print
 
-          for DIR in "$RES"/mipmap-*; do
-            [ -d "$DIR" ] || continue
+      # 9. تنظیم مخازن جایگزین Gradle
+      - name: Configure Gradle repositories
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            for NAME in ic_launcher ic_launcher_round; do
-              PNG="$DIR/$NAME.png"
-              WEBP="$DIR/$NAME.webp"
+          cat > "$RUNNER_TEMP/gradle-init.gradle" <<'EOF'
+          settingsEvaluated { settings ->
+              settings.pluginManagement.repositories {
+                  maven {
+                      url 'https://maven.aliyun.com/repository/gradle-plugin'
+                  }
+                  maven {
+                      url 'https://maven.aliyun.com/repository/google'
+                  }
+                  maven {
+                      url 'https://maven.aliyun.com/repository/public'
+                  }
+                  gradlePluginPortal()
+                  google()
+                  mavenCentral()
+              }
+          }
 
-              if [ -f "$PNG" ] && [ -f "$WEBP" ]; then
-                echo "Duplicate still exists: $DIR/$NAME"
-                exit 1
-              fi
-            done
-          done
+          gradle.beforeProject { project ->
+              project.buildscript.repositories {
+                  maven {
+                      url 'https://maven.aliyun.com/repository/google'
+                  }
+                  maven {
+                      url 'https://maven.aliyun.com/repository/gradle-plugin'
+                  }
+                  maven {
+                      url 'https://maven.aliyun.com/repository/public'
+                  }
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
 
-          echo "Launcher resource check passed."
+              project.repositories {
+                  maven {
+                      url 'https://maven.aliyun.com/repository/google'
+                  }
+                  maven {
+                      url 'https://maven.aliyun.com/repository/public'
+                  }
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
 
-      # 9. ساخت APK
+          echo "Gradle fallback repositories configured."
+
+      # 10. ساخت APK
       - name: Build ARM64 APK
         working-directory: .build/upstream
         shell: bash
@@ -187,12 +226,39 @@ jobs:
 
           chmod +x gradlew
 
-          ./gradlew \
-            --no-daemon \
-            --stacktrace \
-            clean assembleDebug
+          BUILD_SUCCESS=0
 
-      # 10. بررسی معماری APK
+          for ATTEMPT in 1 2 3; do
+            echo "======================================"
+            echo "Build attempt: $ATTEMPT / 3"
+            echo "======================================"
+
+            if ./gradlew \
+              --no-daemon \
+              --no-configuration-cache \
+              --refresh-dependencies \
+              --init-script "$RUNNER_TEMP/gradle-init.gradle" \
+              --stacktrace \
+              clean assembleDebug; then
+
+              BUILD_SUCCESS=1
+              break
+            fi
+
+            if [ "$ATTEMPT" -lt 3 ]; then
+              echo "Build failed. Retrying in 20 seconds..."
+              sleep 20
+            fi
+          done
+
+          if [ "$BUILD_SUCCESS" -ne 1 ]; then
+            echo "Gradle build failed after 3 attempts."
+            exit 1
+          fi
+
+          echo "APK build completed."
+
+      # 11. بررسی وجود APK و معماری ARM64
       - name: Verify APK architecture
         shell: bash
         run: |
@@ -205,24 +271,26 @@ jobs:
             exit 1
           fi
 
-          echo "Checking APK native libraries..."
+          echo "APK file information:"
+          ls -lh "$APK"
 
+          echo "Native libraries:"
           unzip -Z1 "$APK" | grep '^lib/' || true
 
           if ! unzip -Z1 "$APK" | grep -q '^lib/arm64-v8a/'; then
-            echo "ARM64 libraries not found."
+            echo "ARM64 native libraries not found."
             exit 1
           fi
 
           if unzip -Z1 "$APK" | grep -Eq \
             '^lib/(armeabi-v7a|x86|x86_64)/'; then
-            echo "Unexpected ABI found."
+            echo "Unexpected ABI found in APK."
             exit 1
           fi
 
           echo "ARM64 verification passed."
 
-      # 11. آماده‌سازی خروجی
+      # 12. آماده‌سازی خروجی
       - name: Prepare APK artifact
         shell: bash
         run: |
@@ -240,7 +308,7 @@ jobs:
           echo "Final APK:"
           ls -lh artifacts/
 
-      # 12. انتشار فایل APK
+      # 13. انتشار APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -248,3 +316,15 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
           retention-days: 30
+
+      # 14. ذخیره لاگ در صورت شکست
+      - name: Upload Gradle diagnostic logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Frago-Build-Diagnostics
+          path: |
+            .build/upstream/build/reports/
+            .build/upstream/app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 7
