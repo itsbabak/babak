@@ -1,0 +1,72 @@
+name: Build Frago APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Frago overlay
+        uses: actions/checkout@v4
+
+      - name: Verify Frago source files
+        run: |
+          test -f tools/apply_overlay.py || { echo "Missing tools/apply_overlay.py. Upload the COMPLETE Frago ZIP contents to the repository root."; exit 1; }
+          test -f overlay/src/main/java/io/github/dovecoteescapee/byedpi/FragoActivity.kt || { echo "Missing overlay source files. Upload the COMPLETE Frago ZIP contents to the repository root."; exit 1; }
+          test -f frago-config.example.json || { echo "Missing frago-config.example.json."; exit 1; }
+          echo "Frago source tree found."
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android build packages
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager --install \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;26.3.11579264" \
+            "cmake;3.22.1"
+
+      - name: Fetch upstream native Android project
+        run: |
+          mkdir -p .build
+          git clone --depth 1 --branch v1.2.0 https://github.com/dovecoteescapee/ByeDPIAndroid.git .build/upstream
+          git -C .build/upstream submodule update --init --recursive
+
+      - name: Apply Frago app overlay
+        run: python3 tools/apply_overlay.py .build/upstream
+
+      - name: Build arm64 APK
+        working-directory: .build/upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon clean assembleDebug
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifacts
+          cp .build/upstream/app/build/outputs/apk/debug/app-debug.apk artifacts/Frago-arm64-debug.apk
+          sha256sum artifacts/Frago-arm64-debug.apk > artifacts/SHA256SUMS.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Frago-arm64-debug-apk
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
