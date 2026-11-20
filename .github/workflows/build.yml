@@ -3,44 +3,75 @@ name: Build Frago APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
 
 permissions:
   contents: read
 
+concurrency:
+  group: frago-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Extract FIX3 source and build ARM64 APK
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract Frago source ZIP
+      - name: Extract and validate Frago FIX3 ZIP
         shell: bash
         run: |
           set -euo pipefail
-          ZIP_FILE="$(find . -maxdepth 2 -type f -name 'Frago-GitHub-Source-FIX2.zip' -print -quit)"
-          if [ -z "$ZIP_FILE" ]; then
-            echo "Frago ZIP was not found in the repository."
-            exit 1
-          fi
-          mkdir -p .frago-extract
-          unzip -q "$ZIP_FILE" -d .frago-extract
-          APPLY_FILE="$(find .frago-extract -type f -path '*/tools/apply_overlay.py' -print -quit)"
-          if [ -z "$APPLY_FILE" ]; then
-            echo "The ZIP does not contain tools/apply_overlay.py."
-            echo "Check that the correct complete Frago source ZIP was uploaded."
-            exit 1
-          fi
-          SOURCE_ROOT="$(dirname "$(dirname "$APPLY_FILE")")"
-          echo "Using Frago source root: $SOURCE_ROOT"
-          cp -a "$SOURCE_ROOT"/. .
-          test -f tools/apply_overlay.py
-          test -f overlay/src/main/java/io/github/dovecoteescapee/byedpi/FragoActivity.kt
-          test -f frago-config.example.json
-          echo "Frago source extracted and verified."
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
 
-      - name: Set up Java
+          workspace = Path.cwd()
+          archive = workspace / "Frago-GitHub-Source-FIX3.zip"
+          destination = workspace / ".frago-source"
+
+          if not archive.is_file():
+              raise SystemExit(
+                  "Frago-GitHub-Source-FIX3.zip was not found at the repository root. "
+                  "Upload the ZIP to the root of itsbabak/babak."
+              )
+
+          required = [
+              "tools/apply_overlay.py",
+              "overlay/src/main/java/io/github/dovecoteescapee/byedpi/FragoActivity.kt",
+              "overlay/src/main/java/io/github/dovecoteescapee/byedpi/services/FragoVpnService.kt",
+              "frago-config.example.json",
+          ]
+
+          destination.mkdir(parents=True, exist_ok=True)
+          with ZipFile(archive) as zf:
+              names = set(zf.namelist())
+              missing = [name for name in required if name not in names]
+              if missing:
+                  raise SystemExit("The FIX3 ZIP is incomplete; missing: " + ", ".join(missing))
+
+              # Reject path traversal entries before extracting the archive.
+              root = destination.resolve()
+              for info in zf.infolist():
+                  target = (destination / info.filename).resolve()
+                  if target != root and root not in target.parents:
+                      raise SystemExit(f"Unsafe ZIP entry: {info.filename}")
+              zf.extractall(destination)
+
+          for name in required:
+              if not (destination / name).is_file():
+                  raise SystemExit(f"Extraction failed; missing {name}")
+
+          print("FIX3 archive extracted and all required source files verified.")
+          PY
+
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -51,46 +82,74 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Install Android build packages
+      - name: Install Android SDK and NDK packages
+        shell: bash
         run: |
-          yes | sdkmanager --licenses || true
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install \
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "ndk;26.3.11579264" \
             "cmake;3.22.1"
 
-      - name: Fetch upstream native Android project
-        run: |
-          mkdir -p .build
-          git clone --depth 1 --branch v1.2.0 https://github.com/dovecoteescapee/ByeDPIAndroid.git .build/upstream
-          git -C .build/upstream submodule update --init --recursive
-
-      - name: Apply Frago app overlay
-        run: python3 tools/apply_overlay.py .build/upstream
-
-      - name: Remove duplicate launcher icon resources
+      - name: Fetch pinned ByeDPIAndroid source
         shell: bash
         run: |
           set -euo pipefail
-          RES_DIR=".build/upstream/app/src/main/res"
-          if [ -d "$RES_DIR" ]; then
-            find "$RES_DIR" -type f -path '*/mipmap-*' \( -name 'ic_launcher.png' -o -name 'ic_launcher_round.png' \) -print -delete
-          fi
+          mkdir -p .build
+          git clone --depth 1 --branch v1.2.0 \
+            https://github.com/dovecoteescapee/ByeDPIAndroid.git .build/upstream
+          git -C .build/upstream submodule update --init --recursive
 
-      - name: Build arm64 APK
-        working-directory: .build/upstream
+      - name: Apply Frago FIX3 overlay
+        shell: bash
         run: |
+          set -euo pipefail
+          python3 .frago-source/tools/apply_overlay.py .build/upstream
+
+      - name: Resolve duplicate launcher icon formats
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          res = Path(".build/upstream/app/src/main/res")
+          removed = []
+          for folder in res.glob("mipmap-*"):
+              if not folder.is_dir():
+                  continue
+              for webp in folder.glob("ic_launcher*.webp"):
+                  png = webp.with_suffix(".png")
+                  if png.is_file():
+                      webp.unlink()
+                      removed.append(str(webp))
+          print("Removed duplicate upstream WebP icons; kept Frago PNG icons:")
+          for item in removed:
+              print(" -", item)
+          PY
+
+      - name: Build Frago ARM64 debug APK
+        working-directory: .build/upstream
+        shell: bash
+        run: |
+          set -euo pipefail
           chmod +x gradlew
           ./gradlew --no-daemon clean assembleDebug
 
-      - name: Prepare artifact
+      - name: Verify and prepare APK artifact
+        shell: bash
         run: |
+          set -euo pipefail
+          APK=".build/upstream/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
           mkdir -p artifacts
-          cp .build/upstream/app/build/outputs/apk/debug/app-debug.apk artifacts/Frago-arm64-debug.apk
+          cp "$APK" artifacts/Frago-arm64-debug.apk
           sha256sum artifacts/Frago-arm64-debug.apk > artifacts/SHA256SUMS.txt
+          ls -lh artifacts/
 
-      - name: Upload APK
+      - name: Upload Frago APK
         uses: actions/upload-artifact@v4
         with:
           name: Frago-arm64-debug-apk
