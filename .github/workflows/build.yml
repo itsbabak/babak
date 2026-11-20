@@ -49,21 +49,18 @@ jobs:
 
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
-          if [ ! -f "$SDKMANAGER" ]; then
+          if [ ! -x "$SDKMANAGER" ]; then
             SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
-              -type f -name sdkmanager | sort -V | tail -n 1)
+              -type f -name sdkmanager -executable \
+              | sort -V | tail -n 1 || true)
           fi
 
-          if [ -z "$SDKMANAGER" ] || [ ! -f "$SDKMANAGER" ]; then
-            echo "SDK Manager not found!"
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "Executable SDK Manager not found!"
             exit 1
           fi
 
-          chmod +x "$SDKMANAGER"
-
-          yes | "$SDKMANAGER" --licenses \
-            || echo "Some licenses may already be accepted."
-
+          echo "SDK Manager found."
           echo "Android SDK ready."
 
       - name: Find and Extract Source ZIP
@@ -99,13 +96,11 @@ jobs:
             fi
 
             DEST="${NESTED%.zip}"
-
             mkdir -p "$DEST"
 
-            echo "Extracting nested ZIP: $NESTED"
+            echo "Extracting: $NESTED"
 
             unzip -oq "$NESTED" -d "$DEST"
-
             rm -f "$NESTED"
 
           done
@@ -121,7 +116,6 @@ jobs:
           PROJECT_DIR=$(dirname "$GRADLE_FILE")
 
           echo "Project directory: $PROJECT_DIR"
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Fix Duplicate Launcher Icons
@@ -181,18 +175,6 @@ jobs:
 
           echo "ARM64 configuration checked."
 
-      - name: Accept Android Licenses
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager | sort -V | tail -n 1)
-
-          if [ -n "$SDKMANAGER" ]; then
-            yes | "$SDKMANAGER" --licenses || true
-          fi
-
       - name: Build ARM64 APK
         shell: bash
         run: |
@@ -207,6 +189,26 @@ jobs:
             clean \
             assembleDebug \
             --stacktrace
+
+      - name: Verify APK Architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK=$(find "$PROJECT_DIR" \
+            -type f \
+            -path "*/build/outputs/apk/*/*.apk" \
+            | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "APK not found!"
+            exit 1
+          fi
+
+          echo "APK generated: $APK"
+
+          unzip -l "$APK" | grep -E \
+            'lib/[^/]+/.*\.so$' || true
 
       - name: Collect APK
         shell: bash
@@ -231,7 +233,7 @@ jobs:
 
           mv "$APK" "$OUTPUT/SocksVPN-ARM64.apk"
 
-          echo "APK generated:"
+          echo "Final APK:"
           ls -lh "$OUTPUT"
 
       - name: Upload APK Artifact
