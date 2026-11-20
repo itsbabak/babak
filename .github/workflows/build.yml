@@ -16,6 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -26,40 +30,68 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Build Dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y unzip zip findutils
+
+      - name: Configure Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Android SDK: $ANDROID_HOME"
+
+          if [ ! -d "$ANDROID_HOME" ]; then
+            echo "Android SDK not found!"
+            exit 1
+          fi
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+              -type f -name sdkmanager | sort -V | tail -n 1)
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -f "$SDKMANAGER" ]; then
+            echo "SDK Manager not found!"
+            exit 1
+          fi
+
+          chmod +x "$SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses \
+            || echo "Some licenses may already be accepted."
+
+          echo "Android SDK ready."
 
       - name: Find and Extract Source ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/.build"
+          BUILD_DIR="$GITHUB_WORKSPACE/.build"
+          EXTRACT_DIR="$BUILD_DIR/extracted"
+
+          mkdir -p "$EXTRACT_DIR"
 
           ZIP_FILE=$(find "$GITHUB_WORKSPACE" \
             -maxdepth 1 -type f \
-            -iname "*.zip" | head -n 1)
+            -iname "*.zip" | head -n 1 || true)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "No source ZIP found!"
+            echo "Source ZIP not found!"
             exit 1
           fi
 
-          echo "Found: $ZIP_FILE"
+          echo "Source archive: $ZIP_FILE"
 
-          mkdir -p "$GITHUB_WORKSPACE/.build/extracted"
+          unzip -oq "$ZIP_FILE" -d "$EXTRACT_DIR"
 
-          unzip -oq "$ZIP_FILE" \
-            -d "$GITHUB_WORKSPACE/.build/extracted"
-
-          # Extract nested ZIP archives
           for i in {1..5}; do
-            NESTED=$(find "$GITHUB_WORKSPACE/.build/extracted" \
+
+            NESTED=$(find "$EXTRACT_DIR" \
               -type f -iname "*.zip" | head -n 1 || true)
 
             if [ -z "$NESTED" ]; then
@@ -67,26 +99,28 @@ jobs:
             fi
 
             DEST="${NESTED%.zip}"
+
             mkdir -p "$DEST"
 
-            echo "Extracting nested archive: $NESTED"
+            echo "Extracting nested ZIP: $NESTED"
 
             unzip -oq "$NESTED" -d "$DEST"
+
             rm -f "$NESTED"
+
           done
 
-          # Locate Gradle project
-          GRADLE_FILE=$(find "$GITHUB_WORKSPACE/.build/extracted" \
-            -type f -name gradlew | head -n 1)
+          GRADLE_FILE=$(find "$EXTRACT_DIR" \
+            -type f -name gradlew | head -n 1 || true)
 
           if [ -z "$GRADLE_FILE" ]; then
-            echo "gradlew not found!"
+            echo "Gradle wrapper not found!"
             exit 1
           fi
 
           PROJECT_DIR=$(dirname "$GRADLE_FILE")
 
-          echo "Project: $PROJECT_DIR"
+          echo "Project directory: $PROJECT_DIR"
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
@@ -98,31 +132,35 @@ jobs:
           RES="$PROJECT_DIR/app/src/main/res"
 
           if [ ! -d "$RES" ]; then
-            echo "Resource directory not found: $RES"
+            echo "Android resources directory not found!"
             exit 1
           fi
 
-          echo "Checking duplicate launcher icons..."
+          find "$RES" -type f -name "ic_launcher.png" \
+            -print0 | while IFS= read -r -d '' FILE; do
 
-          find "$RES" -type f -name "ic_launcher.png" | while read -r FILE; do
-            WEBP="${FILE%.png}.webp"
+              WEBP="${FILE%.png}.webp"
 
-            if [ -f "$WEBP" ]; then
-              rm -f "$FILE"
-              echo "Removed duplicate: $FILE"
-            fi
+              if [ -f "$WEBP" ]; then
+                rm -f "$FILE"
+                echo "Removed duplicate: $FILE"
+              fi
+
           done
 
-          find "$RES" -type f -name "ic_launcher_round.png" | while read -r FILE; do
-            WEBP="${FILE%.png}.webp"
+          find "$RES" -type f -name "ic_launcher_round.png" \
+            -print0 | while IFS= read -r -d '' FILE; do
 
-            if [ -f "$WEBP" ]; then
-              rm -f "$FILE"
-              echo "Removed duplicate: $FILE"
-            fi
+              WEBP="${FILE%.png}.webp"
+
+              if [ -f "$WEBP" ]; then
+                rm -f "$FILE"
+                echo "Removed duplicate: $FILE"
+              fi
+
           done
 
-          echo "Icon check completed."
+          echo "Launcher icons checked."
 
       - name: Configure ARM64 Native Build
         shell: bash
@@ -132,25 +170,37 @@ jobs:
           APP_MK="$PROJECT_DIR/app/src/main/jni/Application.mk"
 
           if [ -f "$APP_MK" ]; then
+
             if grep -q "^APP_ABI" "$APP_MK"; then
               sed -i 's/^APP_ABI.*/APP_ABI := arm64-v8a/' "$APP_MK"
             else
               echo "APP_ABI := arm64-v8a" >> "$APP_MK"
             fi
+
           fi
 
           echo "ARM64 configuration checked."
 
-      - name: Grant Gradle Permission
+      - name: Accept Android Licenses
+        shell: bash
         run: |
-          chmod +x "$PROJECT_DIR/gradlew"
+          set -euo pipefail
 
-      - name: Build Debug APK
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager | sort -V | tail -n 1)
+
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses || true
+          fi
+
+      - name: Build ARM64 APK
         shell: bash
         run: |
           set -euo pipefail
 
           cd "$PROJECT_DIR"
+
+          chmod +x gradlew
 
           ./gradlew \
             --no-daemon \
@@ -163,31 +213,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/final-apk"
+          OUTPUT="$GITHUB_WORKSPACE/final-apk"
+
+          mkdir -p "$OUTPUT"
 
           find "$PROJECT_DIR" \
             -type f \
             -path "*/build/outputs/apk/*/*.apk" \
-            -exec cp {} "$GITHUB_WORKSPACE/final-apk/" \;
+            -exec cp {} "$OUTPUT/" \;
 
-          if [ -z "$(find "$GITHUB_WORKSPACE/final-apk" -name "*.apk")" ]; then
+          APK=$(find "$OUTPUT" -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
             echo "APK not generated!"
             exit 1
           fi
 
-          cd "$GITHUB_WORKSPACE/final-apk"
+          mv "$APK" "$OUTPUT/SocksVPN-ARM64.apk"
 
-          for APK in *.apk; do
-            mv "$APK" "SocksVPN-ARM64.apk"
-            break
-          done
+          echo "APK generated:"
+          ls -lh "$OUTPUT"
 
-          ls -lh
-
-      - name: Upload ARM64 APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SocksVPN-ARM64-APK
-          path: final-apk/*.apk
+          path: final-apk/SocksVPN-ARM64.apk
           if-no-files-found: error
           retention-days: 14
