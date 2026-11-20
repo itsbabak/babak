@@ -69,6 +69,17 @@ jobs:
       - name: Apply Frago app overlay
         run: python3 tools/apply_overlay.py .build/upstream
 
+      - name: Remove duplicate launcher icon resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          RES_DIR=".build/upstream/app/src/main/res"
+          if [ -d "$RES_DIR" ]; then
+            find "$RES_DIR" -type f \\
+              \( -path '*/mipmap-*/ic_launcher.png' -o -path '*/mipmap-*/ic_launcher_round.png' \) \\
+              -print -delete
+          fi
+
       - name: Build arm64 APK
         working-directory: .build/upstream
         run: |
