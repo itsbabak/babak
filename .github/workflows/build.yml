@@ -1,105 +1,123 @@
-
-name: Build SocksVPN APK
+name: Build Frago APK (Auto Extract ZIP)
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main, master ]
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build ARM64 APK
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup JDK 17
+      - name: Find and extract Frago source ZIP automatically
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .build/source
+
+          # Prefer a ZIP whose filename contains "frago" (case-insensitive).
+          mapfile -t FRAGO_ZIPS < <(find . -type f \
+            \( -iname '*frago*.zip' \) \
+            -not -path './.git/*' -not -path './.build/*' | sort)
+
+          # If no Frago-named ZIP exists, accept the only ZIP in the repository.
+          if [ "${#FRAGO_ZIPS[@]}" -eq 0 ]; then
+            mapfile -t ALL_ZIPS < <(find . -type f -iname '*.zip' \
+              -not -path './.git/*' -not -path './.build/*' | sort)
+            if [ "${#ALL_ZIPS[@]}" -eq 1 ]; then
+              FRAGO_ZIPS=("${ALL_ZIPS[0]}")
+            elif [ "${#ALL_ZIPS[@]}" -eq 0 ]; then
+              echo "ERROR: No ZIP file found. Upload the Frago source ZIP anywhere inside this repository."
+              exit 1
+            else
+              printf 'Found multiple ZIP files but none has Frago in its name:\n%s\n' "${ALL_ZIPS[@]}"
+              echo "Rename the intended source ZIP so its filename contains 'Frago'."
+              exit 1
+            fi
+          fi
+
+          if [ "${#FRAGO_ZIPS[@]}" -ne 1 ]; then
+            printf 'Found multiple Frago ZIP files:\n%s\n' "${FRAGO_ZIPS[@]}"
+            echo "Keep only one Frago source ZIP in the repository, or remove the older copies."
+            exit 1
+          fi
+
+          ZIP_FILE="${FRAGO_ZIPS[0]}"
+          echo "Selected source archive: $ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d .build/source
+
+          # Detect the actual project root even if the ZIP contains an extra parent folder.
+          SOURCE_ROOT="$(find .build/source -type f -path '*/tools/apply_overlay.py' -print -quit | sed 's#/tools/apply_overlay.py$##')"
+          if [ -z "$SOURCE_ROOT" ]; then
+            echo "ERROR: The ZIP does not contain tools/apply_overlay.py. It may not be the complete Frago source archive."
+            find .build/source -maxdepth 4 -type f | head -80
+            exit 1
+          fi
+
+          test -f "$SOURCE_ROOT/overlay/src/main/java/io/github/dovecoteescapee/byedpi/FragoActivity.kt"
+          test -f "$SOURCE_ROOT/frago-config.example.json"
+          echo "FRAGO_ROOT=$SOURCE_ROOT" >> "$GITHUB_ENV"
+          echo "Frago source detected at: $SOURCE_ROOT"
+
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Find and Extract ZIP Automatically
-        run: |
-          set -e
-
-          echo "Searching for ZIP files..."
-
-          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP file found!"
-            find . -maxdepth 3 -type f
-            exit 1
-          fi
-
-          echo "Selected ZIP: $ZIP_FILE"
-
-          mkdir -p source
-          unzip -q "$ZIP_FILE" -d source
-
-          echo "Extraction completed."
-
-      - name: Find Android Project Automatically
-        run: |
-          set -e
-
-          echo "Searching for Gradle project..."
-
-          PROJECT_DIR=$(find source -type f -name gradlew -printf '%h\n' | head -n 1)
-
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: Android Gradle wrapper not found!"
-
-            find source -maxdepth 5 -type f
-            exit 1
-          fi
-
-          echo "Project found: $PROJECT_DIR"
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
 
-      - name: Accept Android Licenses
-        run: yes | sdkmanager --licenses || true
-
-      - name: Grant Gradle Permission
-        run: chmod +x "$PROJECT_DIR/gradlew"
-
-      - name: Build Release APK
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Install Android build packages
+        shell: bash
         run: |
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;26.3.11579264" \
+            "cmake;3.22.1"
 
-      - name: Collect APK Files
+      - name: Fetch upstream ByeDPI Android project
         run: |
-          set -e
+          set -euo pipefail
+          mkdir -p .build/upstream
+          git clone --depth 1 --branch v1.2.0 https://github.com/dovecoteescapee/ByeDPIAndroid.git .build/upstream
+          git -C .build/upstream submodule update --init --recursive
 
-          mkdir -p final-apk
+      - name: Apply Frago overlay
+        run: python3 "$FRAGO_ROOT/tools/apply_overlay.py" "$GITHUB_WORKSPACE/.build/upstream"
 
-          find "$PROJECT_DIR" -type f -iname "*.apk" \
-            -exec cp {} final-apk/ \;
+      - name: Build ARM64 APK
+        working-directory: .build/upstream
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon clean assembleDebug
 
-          if [ -z "$(ls -A final-apk)" ]; then
-            echo "ERROR: APK not generated!"
-            exit 1
-          fi
-
-          echo "Generated APK files:"
-          ls -lh final-apk
+      - name: Prepare APK artifact
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          APK=".build/upstream/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK" || { echo "APK was not generated at $APK"; exit 1; }
+          cp "$APK" artifacts/Frago-arm64-debug.apk
+          sha256sum artifacts/Frago-arm64-debug.apk > artifacts/SHA256SUMS.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: SocksVPN-ARM64-APK
-          path: final-apk/*.apk
+          name: Frago-arm64-debug-apk
+          path: artifacts/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
