@@ -1,158 +1,111 @@
-name: Build Frago APK
+name: Build SocksVPN Lite ARM64 APK
 
 on:
   workflow_dispatch:
+    inputs:
+      source_zip:
+        description: 'ZIP سورس در ریشه مخزن (اگر سورس مستقیماً در مخزن نیست)'
+        required: false
+        default: 'SocksVPN-Lite-Fragment-Fix-Source.zip'
   push:
-    branches:
-      - main
-      - master
+    branches: [ main, master ]
 
 permissions:
   contents: read
 
-concurrency:
-  group: frago-apk-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
-    name: Extract FIX3 source and build ARM64 APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract and validate Frago FIX3 ZIP
+      - name: Extract source ZIP when needed
+        id: source
         shell: bash
+        env:
+          SOURCE_ZIP_INPUT: ${{ inputs.source_zip }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          from zipfile import ZipFile
+          if [[ -f "$GITHUB_WORKSPACE/gradlew" ]]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+            echo "Source project already exists in repository root."
+          else
+            ZIP_PATH="$GITHUB_WORKSPACE/${SOURCE_ZIP_INPUT:-SocksVPN-Lite-Fragment-Fix-Source.zip}"
+            if [[ ! -f "$ZIP_PATH" ]]; then
+              echo "ERROR: Source ZIP not found: $ZIP_PATH" >&2
+              echo "Upload SocksVPN-Lite-Fragment-Fix-Source.zip to the repository root, or commit the Android project files directly." >&2
+              exit 1
+            fi
+            EXTRACT_DIR="$RUNNER_TEMP/socksvpn-source"
+            mkdir -p "$EXTRACT_DIR"
+            unzip -q "$ZIP_PATH" -d "$EXTRACT_DIR"
+            GRADLEW_PATH="$(find "$EXTRACT_DIR" -type f -name gradlew -print -quit)"
+            if [[ -z "$GRADLEW_PATH" ]]; then
+              echo "ERROR: ZIP does not contain a Gradle Android project (gradlew not found)." >&2
+              exit 1
+            fi
+            PROJECT_DIR="$(dirname "$GRADLEW_PATH")"
+            echo "Extracted source project: $PROJECT_DIR"
+          fi
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-          workspace = Path.cwd()
-          archive = workspace / "Frago-GitHub-Source-FIX3.zip"
-          destination = workspace / ".frago-source"
-
-          if not archive.is_file():
-              raise SystemExit(
-                  "Frago-GitHub-Source-FIX3.zip was not found at the repository root. "
-                  "Upload the ZIP to the root of itsbabak/babak."
-              )
-
-          required = [
-              "tools/apply_overlay.py",
-              "overlay/src/main/java/io/github/dovecoteescapee/byedpi/FragoActivity.kt",
-              "overlay/src/main/java/io/github/dovecoteescapee/byedpi/services/FragoVpnService.kt",
-              "frago-config.example.json",
-          ]
-
-          destination.mkdir(parents=True, exist_ok=True)
-          with ZipFile(archive) as zf:
-              names = set(zf.namelist())
-              missing = [name for name in required if name not in names]
-              if missing:
-                  raise SystemExit("The FIX3 ZIP is incomplete; missing: " + ", ".join(missing))
-
-              # Reject path traversal entries before extracting the archive.
-              root = destination.resolve()
-              for info in zf.infolist():
-                  target = (destination / info.filename).resolve()
-                  if target != root and root not in target.parents:
-                      raise SystemExit(f"Unsafe ZIP entry: {info.filename}")
-              zf.extractall(destination)
-
-          for name in required:
-              if not (destination / name).is_file():
-                  raise SystemExit(f"Extraction failed; missing {name}")
-
-          print("FIX3 archive extracted and all required source files verified.")
-          PY
-
-      - name: Set up Java 17
+      - name: Set up Java 11
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '11'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
-        with:
-          packages: platform-tools
 
-      - name: Install Android SDK and NDK packages
+      - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --install \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "ndk;26.3.11579264" \
-            "cmake;3.22.1"
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-31" "build-tools;31.0.0" "platform-tools"
 
-      - name: Fetch pinned ByeDPIAndroid source
+      - name: Download Xray ARM64 core
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
         run: |
           set -euo pipefail
-          mkdir -p .build
-          git clone --depth 1 --branch v1.2.0 \
-            https://github.com/dovecoteescapee/ByeDPIAndroid.git .build/upstream
-          git -C .build/upstream submodule update --init --recursive
+          XRAY_VERSION="v26.11.9"
+          XRAY_SHA256="edcefc25b9b3195b11e18624c8269a969d6aabc39c6298a9a5ab29de15d46f3b"
+          ARCHIVE="$RUNNER_TEMP/xray-android-arm64.zip"
+          curl -fL --retry 3 --retry-delay 2 \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-android-arm64-v8a.zip" \
+            -o "$ARCHIVE"
+          echo "${XRAY_SHA256}  ${ARCHIVE}" | sha256sum --check -
+          mkdir -p "$RUNNER_TEMP/xray-core"
+          unzip -q "$ARCHIVE" -d "$RUNNER_TEMP/xray-core"
+          XRAY_BIN="$(find "$RUNNER_TEMP/xray-core" -type f -name xray -print -quit)"
+          test -n "$XRAY_BIN"
+          install -D -m 755 "$XRAY_BIN" "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libxray.so"
+          mkdir -p "$PROJECT_DIR/app/src/main/assets/xray"
+          curl -fL --retry 3 \
+            "https://raw.githubusercontent.com/XTLS/Xray-core/${XRAY_VERSION}/LICENSE" \
+            -o "$PROJECT_DIR/app/src/main/assets/xray/LICENSE"
+          readelf -h "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libxray.so" | grep -Eq 'Machine:.*AArch64'
 
-      - name: Apply Frago FIX3 overlay
+      - name: Build APKs
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.source.outputs.project_dir }}
         run: |
           set -euo pipefail
-          python3 .frago-source/tools/apply_overlay.py .build/upstream
+          cd "$PROJECT_DIR"
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace clean assembleDebug assembleRelease
 
-      - name: Resolve duplicate launcher icon formats
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          res = Path(".build/upstream/app/src/main/res")
-          removed = []
-          for folder in res.glob("mipmap-*"):
-              if not folder.is_dir():
-                  continue
-              for webp in folder.glob("ic_launcher*.webp"):
-                  png = webp.with_suffix(".png")
-                  if png.is_file():
-                      webp.unlink()
-                      removed.append(str(webp))
-          print("Removed duplicate upstream WebP icons; kept Frago PNG icons:")
-          for item in removed:
-              print(" -", item)
-          PY
-
-      - name: Build Frago ARM64 debug APK
-        working-directory: .build/upstream
-        shell: bash
-        run: |
-          set -euo pipefail
-          chmod +x gradlew
-          ./gradlew --no-daemon clean assembleDebug
-
-      - name: Verify and prepare APK artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          APK=".build/upstream/app/build/outputs/apk/debug/app-debug.apk"
-          test -s "$APK"
-          mkdir -p artifacts
-          cp "$APK" artifacts/Frago-arm64-debug.apk
-          sha256sum artifacts/Frago-arm64-debug.apk > artifacts/SHA256SUMS.txt
-          ls -lh artifacts/
-
-      - name: Upload Frago APK
+      - name: Upload APK files
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-arm64-debug-apk
-          path: artifacts/*
+          name: SocksVPN-Lite-ARM64-APKs
+          path: |
+            ${{ steps.source.outputs.project_dir }}/app/build/outputs/apk/debug/app-debug.apk
+            ${{ steps.source.outputs.project_dir }}/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 30
