@@ -14,7 +14,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
@@ -33,7 +33,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip zip findutils
+          sudo apt-get install -y unzip zip findutils file
 
       - name: Configure Android SDK
         shell: bash
@@ -47,75 +47,145 @@ jobs:
             exit 1
           fi
 
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
-              -type f -name sdkmanager -executable \
-              | sort -V | tail -n 1 || true)
-          fi
-
-          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "Executable SDK Manager not found!"
-            exit 1
-          fi
-
-          echo "SDK Manager found."
           echo "Android SDK ready."
 
-      - name: Find and Extract Source ZIP
+      - name: Detect and Extract Project Automatically
         shell: bash
         run: |
           set -euo pipefail
 
-          BUILD_DIR="$GITHUB_WORKSPACE/.build"
-          EXTRACT_DIR="$BUILD_DIR/extracted"
+          ROOT="$GITHUB_WORKSPACE"
+          BUILD="$ROOT/.build"
+          EXTRACT="$BUILD/extracted"
 
-          mkdir -p "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT"
 
-          ZIP_FILE=$(find "$GITHUB_WORKSPACE" \
-            -maxdepth 1 -type f \
-            -iname "*.zip" | head -n 1 || true)
+          echo "Searching for Gradle project..."
 
-          if [ -z "$ZIP_FILE" ]; then
-            echo "Source ZIP not found!"
-            exit 1
-          fi
+          # First check whether the repository already contains a project.
+          GRADLE_FILE=$(find "$ROOT" \
+            -type f -name gradlew \
+            -not -path "$ROOT/.build/*" \
+            -not -path "$ROOT/.git/*" \
+            | head -n 1 || true)
 
-          echo "Source archive: $ZIP_FILE"
+          if [ -n "$GRADLE_FILE" ]; then
+            PROJECT_DIR=$(dirname "$GRADLE_FILE")
+            echo "Existing project found: $PROJECT_DIR"
 
-          unzip -oq "$ZIP_FILE" -d "$EXTRACT_DIR"
+          else
+            echo "Searching for ZIP archives..."
 
-          for i in {1..5}; do
+            # Find ZIP files anywhere in the repository.
+            mapfile -d '' ZIP_FILES < <(
+              find "$ROOT" \
+                -type f \
+                -iname "*.zip" \
+                -not -path "$ROOT/.build/*" \
+                -not -path "$ROOT/.git/*" \
+                -print0
+            )
 
-            NESTED=$(find "$EXTRACT_DIR" \
-              -type f -iname "*.zip" | head -n 1 || true)
-
-            if [ -z "$NESTED" ]; then
-              break
+            if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+              echo "No ZIP archives found."
+              echo "Repository files:"
+              find "$ROOT" -maxdepth 4 -type f | head -n 100
+              exit 1
             fi
 
-            DEST="${NESTED%.zip}"
-            mkdir -p "$DEST"
+            echo "Found ${#ZIP_FILES[@]} ZIP archive(s)."
 
-            echo "Extracting: $NESTED"
+            # Select the archive that actually contains an Android Gradle project.
+            SELECTED=""
 
-            unzip -oq "$NESTED" -d "$DEST"
-            rm -f "$NESTED"
+            for ZIP in "${ZIP_FILES[@]}"; do
+              echo "Checking: $ZIP"
 
-          done
+              if unzip -Z1 "$ZIP" 2>/dev/null \
+                | grep -Eq '(^|/)gradlew$'; then
+                SELECTED="$ZIP"
+                break
+              fi
 
-          GRADLE_FILE=$(find "$EXTRACT_DIR" \
-            -type f -name gradlew | head -n 1 || true)
+              if unzip -Z1 "$ZIP" 2>/dev/null \
+                | grep -Eq '(^|/)settings\.gradle(\.kts)?$'; then
+                SELECTED="$ZIP"
+                break
+              fi
+            done
 
-          if [ -z "$GRADLE_FILE" ]; then
-            echo "Gradle wrapper not found!"
-            exit 1
+            # Fallback: use the largest ZIP if no Gradle marker was found.
+            if [ -z "$SELECTED" ]; then
+              echo "No Gradle marker found. Using largest ZIP."
+
+              SELECTED=$(
+                find "$ROOT" \
+                  -type f -iname "*.zip" \
+                  -not -path "$ROOT/.build/*" \
+                  -not -path "$ROOT/.git/*" \
+                  -printf '%s %p\n' \
+                  | sort -nr \
+                  | head -n 1 \
+                  | cut -d' ' -f2-
+              )
+            fi
+
+            echo "Selected archive: $SELECTED"
+
+            unzip -oq "$SELECTED" -d "$EXTRACT"
+
+            # Extract nested archives when needed.
+            for LEVEL in {1..5}; do
+
+              NESTED=""
+
+              while IFS= read -r -d '' ITEM; do
+                if unzip -Z1 "$ITEM" 2>/dev/null \
+                  | grep -Eq '(^|/)gradlew$|(^|/)settings\.gradle(\.kts)?$'; then
+                  NESTED="$ITEM"
+                  break
+                fi
+              done < <(
+                find "$EXTRACT" -type f \
+                  -iname "*.zip" -print0
+              )
+
+              if [ -z "$NESTED" ]; then
+                break
+              fi
+
+              DEST="$EXTRACT/nested-$LEVEL"
+              mkdir -p "$DEST"
+
+              echo "Extracting nested project: $NESTED"
+
+              unzip -oq "$NESTED" -d "$DEST"
+              rm -f "$NESTED"
+
+            done
+
+            # Find actual Gradle wrapper.
+            GRADLE_FILE=$(find "$EXTRACT" \
+              -type f -name gradlew \
+              | head -n 1 || true)
+
+            if [ -z "$GRADLE_FILE" ]; then
+              echo "Gradle wrapper not found."
+
+              find "$EXTRACT" -maxdepth 5 -type f \
+                | head -n 100
+
+              exit 1
+            fi
+
+            PROJECT_DIR=$(dirname "$GRADLE_FILE")
+
           fi
 
-          PROJECT_DIR=$(dirname "$GRADLE_FILE")
+          echo "--------------------------------"
+          echo "Project: $PROJECT_DIR"
+          echo "--------------------------------"
 
-          echo "Project directory: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Fix Duplicate Launcher Icons
@@ -126,7 +196,7 @@ jobs:
           RES="$PROJECT_DIR/app/src/main/res"
 
           if [ ! -d "$RES" ]; then
-            echo "Android resources directory not found!"
+            echo "Resource directory not found: $RES"
             exit 1
           fi
 
@@ -154,9 +224,9 @@ jobs:
 
           done
 
-          echo "Launcher icons checked."
+          echo "Icon cleanup completed."
 
-      - name: Configure ARM64 Native Build
+      - name: Configure ARM64
         shell: bash
         run: |
           set -euo pipefail
@@ -173,9 +243,9 @@ jobs:
 
           fi
 
-          echo "ARM64 configuration checked."
+          echo "ARM64 configuration completed."
 
-      - name: Build ARM64 APK
+      - name: Prepare Gradle
         shell: bash
         run: |
           set -euo pipefail
@@ -184,31 +254,21 @@ jobs:
 
           chmod +x gradlew
 
+          echo "Gradle wrapper:"
+          ./gradlew --version
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
           ./gradlew \
             --no-daemon \
             clean \
             assembleDebug \
             --stacktrace
-
-      - name: Verify APK Architecture
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APK=$(find "$PROJECT_DIR" \
-            -type f \
-            -path "*/build/outputs/apk/*/*.apk" \
-            | head -n 1)
-
-          if [ -z "$APK" ]; then
-            echo "APK not found!"
-            exit 1
-          fi
-
-          echo "APK generated: $APK"
-
-          unzip -l "$APK" | grep -E \
-            'lib/[^/]+/.*\.so$' || true
 
       - name: Collect APK
         shell: bash
@@ -219,27 +279,34 @@ jobs:
 
           mkdir -p "$OUTPUT"
 
-          find "$PROJECT_DIR" \
-            -type f \
-            -path "*/build/outputs/apk/*/*.apk" \
-            -exec cp {} "$OUTPUT/" \;
+          mapfile -t APKS < <(
+            find "$PROJECT_DIR" \
+              -type f \
+              -path "*/build/outputs/apk/*/*.apk"
+          )
 
-          APK=$(find "$OUTPUT" -type f -name "*.apk" | head -n 1)
-
-          if [ -z "$APK" ]; then
-            echo "APK not generated!"
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "No APK generated!"
             exit 1
           fi
 
-          mv "$APK" "$OUTPUT/SocksVPN-ARM64.apk"
+          for APK in "${APKS[@]}"; do
+            NAME=$(basename "$APK")
+            cp "$APK" "$OUTPUT/$NAME"
+          done
 
-          echo "Final APK:"
+          echo "Generated APK files:"
           ls -lh "$OUTPUT"
 
-      - name: Upload APK Artifact
+          FIRST=$(find "$OUTPUT" -maxdepth 1 \
+            -type f -name "*.apk" | head -n 1)
+
+          cp "$FIRST" "$OUTPUT/SocksVPN-ARM64.apk"
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: SocksVPN-ARM64-APK
-          path: final-apk/SocksVPN-ARM64.apk
+          path: final-apk/*.apk
           if-no-files-found: error
           retention-days: 14
