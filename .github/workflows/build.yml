@@ -11,51 +11,63 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: frago-arm64-build
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
     steps:
+      # 1. دریافت مخزن
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. پیدا کردن و استخراج سورس Frago
       - name: Locate and extract Frago source
         id: source
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           mkdir -p .build/frago-source
 
-          if [ -f "tools/apply_overlay.py" ]; then
+          if [ -f "tools/apply_overlay.py" ] && [ -f "tools/build.py" ]; then
             SOURCE_DIR="$GITHUB_WORKSPACE"
             echo "Frago source found in repository root."
           else
             ARCHIVE=$(find "$GITHUB_WORKSPACE" \
-              -maxdepth 3 -type f \
+              -maxdepth 3 \
+              -type f \
               -iname "Frago-Xray-Compat-Source.zip" \
               -print -quit)
 
             if [ -z "$ARCHIVE" ]; then
               ARCHIVE=$(find "$GITHUB_WORKSPACE" \
-                -maxdepth 3 -type f -iname "*.zip" \
+                -maxdepth 3 \
+                -type f \
+                -iname "*.zip" \
                 -print -quit)
             fi
 
             if [ -z "$ARCHIVE" ]; then
-              echo "No Frago source ZIP found."
+              echo "No source ZIP found."
               exit 1
             fi
 
             echo "Extracting: $ARCHIVE"
+
             unzip -q "$ARCHIVE" -d .build/frago-source
 
             APPLY_SCRIPT=$(find .build/frago-source \
-              -type f -path "*/tools/apply_overlay.py" \
+              -type f \
+              -path "*/tools/apply_overlay.py" \
               -print -quit)
 
             if [ -z "$APPLY_SCRIPT" ]; then
-              echo "Frago tools/apply_overlay.py not found in ZIP."
+              echo "apply_overlay.py not found."
               exit 1
             fi
 
@@ -64,26 +76,29 @@ jobs:
 
           test -f "$SOURCE_DIR/tools/apply_overlay.py"
           test -f "$SOURCE_DIR/tools/build.py"
-          test -d "$SOURCE_DIR/overlay/src/main"
 
           echo "source_dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
-          echo "Frago source directory: $SOURCE_DIR"
 
+          echo "Selected source: $SOURCE_DIR"
+
+      # 3. نصب Java
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      # 4. تنظیم Android SDK
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
           packages: platform-tools
 
+      # 5. نصب ابزارهای موردنیاز
       - name: Install Android build packages
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           sdkmanager --install \
             "platforms;android-34" \
@@ -91,10 +106,11 @@ jobs:
             "ndk;26.3.11579264" \
             "cmake;3.22.1"
 
+      # 6. دریافت پروژه اصلی ByeDPIAndroid
       - name: Fetch upstream ByeDPIAndroid
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           mkdir -p .build
 
@@ -106,21 +122,68 @@ jobs:
 
           git -C .build/upstream submodule update --init --recursive
 
+      # 7. اعمال تغییرات Frago
       - name: Apply Frago overlay
         shell: bash
         env:
           SOURCE_DIR: ${{ steps.source.outputs.source_dir }}
         run: |
-          set -e
+          set -euo pipefail
 
           python3 "$SOURCE_DIR/tools/apply_overlay.py" \
             "$GITHUB_WORKSPACE/.build/upstream"
 
+          echo "Frago overlay applied successfully."
+
+      # 8. رفع تداخل آیکون‌ها
+      - name: Fix duplicate Android launcher icons
+        working-directory: .build/upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RES="app/src/main/res"
+
+          echo "Checking launcher resources..."
+
+          for DIR in "$RES"/mipmap-*; do
+            [ -d "$DIR" ] || continue
+
+            for NAME in ic_launcher ic_launcher_round; do
+              PNG="$DIR/$NAME.png"
+              WEBP="$DIR/$NAME.webp"
+
+              if [ -f "$PNG" ] && [ -f "$WEBP" ]; then
+                echo "Duplicate found: $PNG"
+                rm -f "$PNG"
+              fi
+            done
+          done
+
+          echo "Checking remaining duplicates..."
+
+          for DIR in "$RES"/mipmap-*; do
+            [ -d "$DIR" ] || continue
+
+            for NAME in ic_launcher ic_launcher_round; do
+              PNG="$DIR/$NAME.png"
+              WEBP="$DIR/$NAME.webp"
+
+              if [ -f "$PNG" ] && [ -f "$WEBP" ]; then
+                echo "Duplicate still exists: $DIR/$NAME"
+                exit 1
+              fi
+            done
+          done
+
+          echo "Launcher resource check passed."
+
+      # 9. ساخت APK
       - name: Build ARM64 APK
         working-directory: .build/upstream
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           chmod +x gradlew
 
@@ -129,10 +192,11 @@ jobs:
             --stacktrace \
             clean assembleDebug
 
+      # 10. بررسی معماری APK
       - name: Verify APK architecture
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           APK=".build/upstream/app/build/outputs/apk/debug/app-debug.apk"
 
@@ -146,32 +210,37 @@ jobs:
           unzip -Z1 "$APK" | grep '^lib/' || true
 
           if ! unzip -Z1 "$APK" | grep -q '^lib/arm64-v8a/'; then
-            echo "ARM64 native libraries were not found."
+            echo "ARM64 libraries not found."
             exit 1
           fi
 
-          if unzip -Z1 "$APK" | grep -Eq '^lib/(armeabi-v7a|x86|x86_64)/'; then
-            echo "Unexpected extra ABI found in APK."
+          if unzip -Z1 "$APK" | grep -Eq \
+            '^lib/(armeabi-v7a|x86|x86_64)/'; then
+            echo "Unexpected ABI found."
             exit 1
           fi
 
           echo "ARM64 verification passed."
 
+      # 11. آماده‌سازی خروجی
       - name: Prepare APK artifact
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           mkdir -p artifacts
 
-          cp .build/upstream/app/build/outputs/apk/debug/app-debug.apk \
+          cp \
+            .build/upstream/app/build/outputs/apk/debug/app-debug.apk \
             artifacts/Frago-ARM64.apk
 
           sha256sum artifacts/Frago-ARM64.apk \
             > artifacts/SHA256SUMS.txt
 
+          echo "Final APK:"
           ls -lh artifacts/
 
+      # 12. انتشار فایل APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
