@@ -25,35 +25,45 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Extract Source ZIP
+      - name: Find and Extract ZIP Automatically
         run: |
-          ZIP_FILE="socksVPN-main.zip"
+          set -e
 
-          if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: $ZIP_FILE not found!"
-            echo "Available files:"
-            find . -maxdepth 2 -type f
+          echo "Searching for ZIP files..."
+
+          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found!"
+            find . -maxdepth 3 -type f
             exit 1
           fi
+
+          echo "Selected ZIP: $ZIP_FILE"
 
           mkdir -p source
           unzip -q "$ZIP_FILE" -d source
 
-          echo "Extracted source:"
-          ls -la source
+          echo "Extraction completed."
 
-      - name: Locate Android Project
+      - name: Find Android Project Automatically
         run: |
+          set -e
+
+          echo "Searching for Gradle project..."
+
           PROJECT_DIR=$(find source -type f -name gradlew -printf '%h\n' | head -n 1)
 
           if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: gradlew not found in extracted ZIP"
-            find source -maxdepth 4 -type f
+            echo "ERROR: Android Gradle wrapper not found!"
+
+            find source -maxdepth 5 -type f
             exit 1
           fi
 
+          echo "Project found: $PROJECT_DIR"
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Android project found: $PROJECT_DIR"
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
@@ -69,16 +79,21 @@ jobs:
         run: |
           ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: Find APK
+      - name: Collect APK Files
         run: |
+          set -e
+
           mkdir -p final-apk
-          find "$PROJECT_DIR" -type f -name "*.apk" -exec cp {} final-apk/ \;
+
+          find "$PROJECT_DIR" -type f -iname "*.apk" \
+            -exec cp {} final-apk/ \;
 
           if [ -z "$(ls -A final-apk)" ]; then
-            echo "ERROR: No APK generated!"
+            echo "ERROR: APK not generated!"
             exit 1
           fi
 
+          echo "Generated APK files:"
           ls -lh final-apk
 
       - name: Upload APK
