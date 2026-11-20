@@ -1,5 +1,5 @@
 
-name: Build SocksVPN ARM64 APK
+name: Build Frago ARM64 APK
 
 on:
   workflow_dispatch:
@@ -13,300 +13,169 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Java
+      - name: Locate and extract Frago source
+        id: source
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p .build/frago-source
+
+          if [ -f "tools/apply_overlay.py" ]; then
+            SOURCE_DIR="$GITHUB_WORKSPACE"
+            echo "Frago source found in repository root."
+          else
+            ARCHIVE=$(find "$GITHUB_WORKSPACE" \
+              -maxdepth 3 -type f \
+              -iname "Frago-Xray-Compat-Source.zip" \
+              -print -quit)
+
+            if [ -z "$ARCHIVE" ]; then
+              ARCHIVE=$(find "$GITHUB_WORKSPACE" \
+                -maxdepth 3 -type f -iname "*.zip" \
+                -print -quit)
+            fi
+
+            if [ -z "$ARCHIVE" ]; then
+              echo "No Frago source ZIP found."
+              exit 1
+            fi
+
+            echo "Extracting: $ARCHIVE"
+            unzip -q "$ARCHIVE" -d .build/frago-source
+
+            APPLY_SCRIPT=$(find .build/frago-source \
+              -type f -path "*/tools/apply_overlay.py" \
+              -print -quit)
+
+            if [ -z "$APPLY_SCRIPT" ]; then
+              echo "Frago tools/apply_overlay.py not found in ZIP."
+              exit 1
+            fi
+
+            SOURCE_DIR="$(dirname "$(dirname "$APPLY_SCRIPT")")"
+          fi
+
+          test -f "$SOURCE_DIR/tools/apply_overlay.py"
+          test -f "$SOURCE_DIR/tools/build.py"
+          test -d "$SOURCE_DIR/overlay/src/main"
+
+          echo "source_dir=$SOURCE_DIR" >> "$GITHUB_OUTPUT"
+          echo "Frago source directory: $SOURCE_DIR"
+
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip zip findutils file
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
 
-      - name: Configure Android SDK
+      - name: Install Android build packages
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          echo "Android SDK: $ANDROID_HOME"
+          sdkmanager --install \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;26.3.11579264" \
+            "cmake;3.22.1"
 
-          if [ ! -d "$ANDROID_HOME" ]; then
-            echo "Android SDK not found!"
-            exit 1
-          fi
-
-          echo "Android SDK ready."
-
-      - name: Detect and Extract Project Automatically
+      - name: Fetch upstream ByeDPIAndroid
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          ROOT="$GITHUB_WORKSPACE"
-          BUILD="$ROOT/.build"
-          EXTRACT="$BUILD/extracted"
+          mkdir -p .build
 
-          mkdir -p "$EXTRACT"
+          git clone \
+            --depth 1 \
+            --branch v1.2.0 \
+            https://github.com/dovecoteescapee/ByeDPIAndroid.git \
+            .build/upstream
 
-          echo "Searching for Gradle project..."
+          git -C .build/upstream submodule update --init --recursive
 
-          # First check whether the repository already contains a project.
-          GRADLE_FILE=$(find "$ROOT" \
-            -type f -name gradlew \
-            -not -path "$ROOT/.build/*" \
-            -not -path "$ROOT/.git/*" \
-            | head -n 1 || true)
+      - name: Apply Frago overlay
+        shell: bash
+        env:
+          SOURCE_DIR: ${{ steps.source.outputs.source_dir }}
+        run: |
+          set -e
 
-          if [ -n "$GRADLE_FILE" ]; then
-            PROJECT_DIR=$(dirname "$GRADLE_FILE")
-            echo "Existing project found: $PROJECT_DIR"
+          python3 "$SOURCE_DIR/tools/apply_overlay.py" \
+            "$GITHUB_WORKSPACE/.build/upstream"
 
-          else
-            echo "Searching for ZIP archives..."
-
-            # Find ZIP files anywhere in the repository.
-            mapfile -d '' ZIP_FILES < <(
-              find "$ROOT" \
-                -type f \
-                -iname "*.zip" \
-                -not -path "$ROOT/.build/*" \
-                -not -path "$ROOT/.git/*" \
-                -print0
-            )
-
-            if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
-              echo "No ZIP archives found."
-              echo "Repository files:"
-              find "$ROOT" -maxdepth 4 -type f | head -n 100
-              exit 1
-            fi
-
-            echo "Found ${#ZIP_FILES[@]} ZIP archive(s)."
-
-            # Select the archive that actually contains an Android Gradle project.
-            SELECTED=""
-
-            for ZIP in "${ZIP_FILES[@]}"; do
-              echo "Checking: $ZIP"
-
-              if unzip -Z1 "$ZIP" 2>/dev/null \
-                | grep -Eq '(^|/)gradlew$'; then
-                SELECTED="$ZIP"
-                break
-              fi
-
-              if unzip -Z1 "$ZIP" 2>/dev/null \
-                | grep -Eq '(^|/)settings\.gradle(\.kts)?$'; then
-                SELECTED="$ZIP"
-                break
-              fi
-            done
-
-            # Fallback: use the largest ZIP if no Gradle marker was found.
-            if [ -z "$SELECTED" ]; then
-              echo "No Gradle marker found. Using largest ZIP."
-
-              SELECTED=$(
-                find "$ROOT" \
-                  -type f -iname "*.zip" \
-                  -not -path "$ROOT/.build/*" \
-                  -not -path "$ROOT/.git/*" \
-                  -printf '%s %p\n' \
-                  | sort -nr \
-                  | head -n 1 \
-                  | cut -d' ' -f2-
-              )
-            fi
-
-            echo "Selected archive: $SELECTED"
-
-            unzip -oq "$SELECTED" -d "$EXTRACT"
-
-            # Extract nested archives when needed.
-            for LEVEL in {1..5}; do
-
-              NESTED=""
-
-              while IFS= read -r -d '' ITEM; do
-                if unzip -Z1 "$ITEM" 2>/dev/null \
-                  | grep -Eq '(^|/)gradlew$|(^|/)settings\.gradle(\.kts)?$'; then
-                  NESTED="$ITEM"
-                  break
-                fi
-              done < <(
-                find "$EXTRACT" -type f \
-                  -iname "*.zip" -print0
-              )
-
-              if [ -z "$NESTED" ]; then
-                break
-              fi
-
-              DEST="$EXTRACT/nested-$LEVEL"
-              mkdir -p "$DEST"
-
-              echo "Extracting nested project: $NESTED"
-
-              unzip -oq "$NESTED" -d "$DEST"
-              rm -f "$NESTED"
-
-            done
-
-            # Find actual Gradle wrapper.
-            GRADLE_FILE=$(find "$EXTRACT" \
-              -type f -name gradlew \
-              | head -n 1 || true)
-
-            if [ -z "$GRADLE_FILE" ]; then
-              echo "Gradle wrapper not found."
-
-              find "$EXTRACT" -maxdepth 5 -type f \
-                | head -n 100
-
-              exit 1
-            fi
-
-            PROJECT_DIR=$(dirname "$GRADLE_FILE")
-
-          fi
-
-          echo "--------------------------------"
-          echo "Project: $PROJECT_DIR"
-          echo "--------------------------------"
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-      - name: Fix Duplicate Launcher Icons
+      - name: Build ARM64 APK
+        working-directory: .build/upstream
         shell: bash
         run: |
-          set -euo pipefail
-
-          RES="$PROJECT_DIR/app/src/main/res"
-
-          if [ ! -d "$RES" ]; then
-            echo "Resource directory not found: $RES"
-            exit 1
-          fi
-
-          find "$RES" -type f -name "ic_launcher.png" \
-            -print0 | while IFS= read -r -d '' FILE; do
-
-              WEBP="${FILE%.png}.webp"
-
-              if [ -f "$WEBP" ]; then
-                rm -f "$FILE"
-                echo "Removed duplicate: $FILE"
-              fi
-
-          done
-
-          find "$RES" -type f -name "ic_launcher_round.png" \
-            -print0 | while IFS= read -r -d '' FILE; do
-
-              WEBP="${FILE%.png}.webp"
-
-              if [ -f "$WEBP" ]; then
-                rm -f "$FILE"
-                echo "Removed duplicate: $FILE"
-              fi
-
-          done
-
-          echo "Icon cleanup completed."
-
-      - name: Configure ARM64
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APP_MK="$PROJECT_DIR/app/src/main/jni/Application.mk"
-
-          if [ -f "$APP_MK" ]; then
-
-            if grep -q "^APP_ABI" "$APP_MK"; then
-              sed -i 's/^APP_ABI.*/APP_ABI := arm64-v8a/' "$APP_MK"
-            else
-              echo "APP_ABI := arm64-v8a" >> "$APP_MK"
-            fi
-
-          fi
-
-          echo "ARM64 configuration completed."
-
-      - name: Prepare Gradle
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT_DIR"
+          set -e
 
           chmod +x gradlew
 
-          echo "Gradle wrapper:"
-          ./gradlew --version
-
-      - name: Build APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd "$PROJECT_DIR"
-
           ./gradlew \
             --no-daemon \
-            clean \
-            assembleDebug \
-            --stacktrace
+            --stacktrace \
+            clean assembleDebug
 
-      - name: Collect APK
+      - name: Verify APK architecture
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          OUTPUT="$GITHUB_WORKSPACE/final-apk"
+          APK=".build/upstream/app/build/outputs/apk/debug/app-debug.apk"
 
-          mkdir -p "$OUTPUT"
-
-          mapfile -t APKS < <(
-            find "$PROJECT_DIR" \
-              -type f \
-              -path "*/build/outputs/apk/*/*.apk"
-          )
-
-          if [ "${#APKS[@]}" -eq 0 ]; then
-            echo "No APK generated!"
+          if [ ! -f "$APK" ]; then
+            echo "APK was not generated."
             exit 1
           fi
 
-          for APK in "${APKS[@]}"; do
-            NAME=$(basename "$APK")
-            cp "$APK" "$OUTPUT/$NAME"
-          done
+          echo "Checking APK native libraries..."
 
-          echo "Generated APK files:"
-          ls -lh "$OUTPUT"
+          unzip -Z1 "$APK" | grep '^lib/' || true
 
-          FIRST=$(find "$OUTPUT" -maxdepth 1 \
-            -type f -name "*.apk" | head -n 1)
+          if ! unzip -Z1 "$APK" | grep -q '^lib/arm64-v8a/'; then
+            echo "ARM64 native libraries were not found."
+            exit 1
+          fi
 
-          cp "$FIRST" "$OUTPUT/SocksVPN-ARM64.apk"
+          if unzip -Z1 "$APK" | grep -Eq '^lib/(armeabi-v7a|x86|x86_64)/'; then
+            echo "Unexpected extra ABI found in APK."
+            exit 1
+          fi
+
+          echo "ARM64 verification passed."
+
+      - name: Prepare APK artifact
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p artifacts
+
+          cp .build/upstream/app/build/outputs/apk/debug/app-debug.apk \
+            artifacts/Frago-ARM64.apk
+
+          sha256sum artifacts/Frago-ARM64.apk \
+            > artifacts/SHA256SUMS.txt
+
+          ls -lh artifacts/
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: SocksVPN-ARM64-APK
-          path: final-apk/*.apk
+          name: Frago-ARM64-APK
+          path: artifacts/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
